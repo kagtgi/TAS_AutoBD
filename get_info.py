@@ -1,18 +1,32 @@
 """
-TAS AutoBD — Company Research Agent (Agentic)
-===============================================
-Uses Claude's native tool-use (ReAct loop) to autonomously research a target
-company.  The agent decides which search queries to run, which pages to fetch,
-and when it has gathered enough intelligence — no more hard-coded 7-query lists.
+TAS AutoBD — Company Research Agent (v2 — Insight-First)
+==========================================================
+Philosophy upgrade: The old system gathered facts. This system hunts for
+*insight* — the specific, surprising, or overlooked information that makes
+a buyer think "how did they know that?"
 
-When ANTHROPIC_API_KEY is available the full agentic path is used.
-When only OPENAI_API_KEY is available the system falls back to the classic
-LangChain-based parallel crawler (identical to the original implementation).
+Three research upgrades over v1
+--------------------------------
+1. Insight Discovery Phase  — explicitly searches for strategic pivots, failures,
+   competitive pressures, and recent leadership signals that most generic research
+   misses. These become the "personalisation hooks" in the proposal.
 
-Public API (unchanged)
-----------------------
+2. Competitive Intelligence Phase — researches the prospect's main competitors
+   deeply to understand where the company is falling behind. This feeds dynamic
+   competitive positioning (not hardcoded "we do AI/ML in Japan").
+
+3. Contact Quality Scoring  — all extracted emails are scored and ranked by
+   decision-maker likelihood using contact_scorer.py. Generic addresses
+   (info@, support@) are flagged, not silently passed to the sales rep.
+
+Public API (unchanged signature)
+---------------------------------
     get_company_information(company_name, another_url="", on_tool_call=None)
-        → (profile_text: str, email_list: List[str])
+        → (profile_text: str, email_list: List[str], scored_contacts: List[ScoredContact])
+
+Note: The function still returns a 2-tuple for backwards compatibility with the
+existing app.py step handler. The scored_contacts are embedded in profile_text as
+a special section that the UI parses.
 """
 
 import re
@@ -31,6 +45,7 @@ from config import (
     get_text_splitter,
     get_tavily_client,
 )
+from contact_scorer import score_contacts, ScoredContact
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +65,13 @@ class Company(BaseModel):
     financial_highlights: str = Field(default="", description="Revenue, funding rounds, growth metrics, or financial health")
     sales_staff_info: str = Field(default="", description="Key decision-makers, sales team, or contact persons")
     contact_information: str = Field(default="", description="Contact details from the company's contact page")
+    # v2 additions
+    key_insights: str = Field(default="", description="3-5 specific, non-obvious facts: recent pivots, failures, competitive pressures, or strategic signals that most people would not know")
+    competitive_gaps: str = Field(default="", description="Where this company is concretely falling behind its competitors — specific, evidence-backed weaknesses")
     summary: str = Field(description="2-3 sentence executive summary highlighting the biggest BD opportunity")
 
 
-# ── Consolidation prompt (shared by both paths) ───────────────────────────────
+# ── Consolidation prompt ───────────────────────────────────────────────────────
 
 _CONSOLIDATE_PROMPT = ChatPromptTemplate.from_messages([
     (
@@ -62,7 +80,13 @@ _CONSOLIDATE_PROMPT = ChatPromptTemplate.from_messages([
         "Convert the research report below into a clean, structured company profile.\n"
         "Preserve ALL email addresses found. Translate everything to English.\n"
         "Focus on information that is actionable for a B2B pitch.\n"
-        "Never fabricate data — only use what is in the report.",
+        "Never fabricate data — only use what is in the report.\n\n"
+        "Pay special attention to:\n"
+        "- key_insights: pull out 3-5 specific, non-obvious, surprising facts\n"
+        "  (recent leadership changes, failed product lines, public complaints,\n"
+        "   lost market share, strategic pivots, regulatory issues, etc.)\n"
+        "- competitive_gaps: identify concrete areas where competitors are ahead\n"
+        "  and this company is visibly struggling or behind.",
     ),
     ("human", "Research report:\n\n{report}"),
 ])
@@ -79,43 +103,64 @@ and data science company specialising in AI/ML and custom software.
 Your task: conduct deep market intelligence on a TARGET COMPANY to identify \
 business-development opportunities for TAS Design Group.
 
-RESEARCH METHODOLOGY — work through these phases with the available tools:
-1. Broad overview   — 2-3 web searches to understand the company (size, industry, history)
-2. Website deep-dive — fetch the company's official website for authoritative details
-3. Strategic context — search for recent news, strategic plans, and upcoming initiatives
-4. Technology audit  — search for current IT stack, software used, digital transformation pain points
-5. Financial signals — search for revenue, funding rounds, investment news
-6. Contacts          — search for and fetch contact/team pages; use extract_emails on them
-7. Competitive lens  — identify main competitors and how the company is positioned
+RESEARCH METHODOLOGY — work through ALL phases with the available tools:
 
-REQUIRED INFORMATION (keep researching until you have ALL of these):
-• Company background, founding story, size (employees, offices)
-• Industry position and main competitors
-• Current strategic priorities and business goals (2024-2025)
-• Technology gaps and digital transformation challenges
-• Current software / IT systems in use
-• Financial highlights (revenue, funding, growth signals)
-• Key decision-makers and their roles
-• ALL email addresses found (especially CTO, IT, marketing, executive contacts)
-• Company website URL
+Phase 1 — Broad Overview (2-3 searches)
+  Understand the company: size, industry, history, business model.
 
-OUTPUT FORMAT
-When you have gathered sufficient information, write a comprehensive profile
-with these sections:
+Phase 2 — Website Deep-Dive
+  Fetch the official website. Look for product lines, recent announcements,
+  and any technology language they use.
 
+Phase 3 — Strategic Context (critical)
+  Search for: recent strategic pivots, new CEO/CTO appointments, M&A activity,
+  failed products, discontinued services, or markets they have exited.
+  These signal pain points and open doors.
+
+Phase 4 — Competitive Intelligence (critical)
+  Identify the company's top 2-3 competitors. Search for evidence that the
+  TARGET company is losing ground: market share loss, negative analyst reports,
+  customer complaints about their technology, competitor announcements that
+  directly threaten them. Be specific.
+
+Phase 5 — Technology Audit
+  Search for their current IT stack, software vendors they use, digital
+  transformation initiatives, and any known tech debt or outages.
+
+Phase 6 — Financial Signals
+  Revenue, funding rounds, cost-cutting news, or growth signals from the
+  last 12-24 months.
+
+Phase 7 — Contact Discovery
+  Fetch the /contact, /about, /team, /leadership pages. Use extract_emails
+  on any page with staff information. Also search LinkedIn-style for
+  "[company] CTO email" or "[company] VP Technology contact".
+
+REQUIRED OUTPUT SECTIONS:
 ## Company Overview
 ## Industry & Market Position
-## Strategic Priorities & Business Needs
+## Strategic Pivots & Recent Signals
+[3-5 specific, non-obvious facts — recent failures, pivots, leadership changes,
+ or competitive pressures. These are the "hooks" that make a proposal feel
+ researched rather than templated.]
+## Competitive Gaps & Weaknesses
+[Where are they concretely falling behind competitors? Be specific and
+ evidence-backed. Never fabricate.]
 ## Technology Gaps & Pain Points
 ## Current Software & IT Systems
 ## Financial Highlights
 ## Key Contacts & Decision-Makers
+[List names, titles, and any email addresses. Prioritise C-suite, VP, Director,
+ CTO-level contacts over generic addresses.]
 ## Email Addresses Found
-[list every email on its own line]
+[List every email on its own line. Mark generic ones with [GENERIC] so they
+ can be filtered.]
 ## Executive Summary
-[2-3 sentences: biggest BD opportunity for TAS Design Group]
+[2-3 sentences: biggest BD opportunity for TAS, referencing a specific
+ competitive gap or strategic pivot you found.]
 
-Translate all content to English.  Never fabricate data."""
+Translate all content to English. Never fabricate data.\
+"""
 
 
 def _agentic_research(
@@ -127,7 +172,13 @@ def _agentic_research(
     from agent_runner import run_agent
     from tools import RESEARCH_TOOL_SCHEMAS
 
-    user_message = f"Research this company for B2B business development: **{company_name}**"
+    user_message = (
+        f"Research this company for B2B business development: **{company_name}**\n\n"
+        f"Be especially thorough on:\n"
+        f"1. Recent strategic pivots, failures, or leadership changes (last 12-24 months)\n"
+        f"2. Where they are losing ground to competitors\n"
+        f"3. Direct contact emails for C-suite, VP, or Director-level people"
+    )
     if another_url and another_url.startswith("http"):
         user_message += f"\n\nAlso include this URL in your research: {another_url}"
 
@@ -135,13 +186,13 @@ def _agentic_research(
         system_prompt=_RESEARCH_SYSTEM,
         user_message=user_message,
         tools=RESEARCH_TOOL_SCHEMAS,
-        max_iterations=12,
+        max_iterations=15,   # increased from 12 to allow deeper research
         on_tool_call=on_tool_call,
     )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PATH B — Classic (OpenAI or no Anthropic key) — original parallel crawler
+# PATH B — Classic (OpenAI or no Anthropic key)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
@@ -156,7 +207,8 @@ _EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
         "- Email addresses of sales, marketing, or executive staff\n"
         "- Current software, platforms, and IT infrastructure\n"
         "- Industry context, competitors, and market position\n"
-        "- Financial health, funding, or growth signals\n\n"
+        "- Financial health, funding, or growth signals\n"
+        "- Recent pivots, failures, leadership changes, or competitive pressures\n\n"
         "If information is not found in the document, use an empty string. "
         "Never fabricate data.",
     ),
@@ -174,26 +226,32 @@ _SUMMARISE_PROMPT = ChatPromptTemplate.from_messages([
         "- Resolve contradictions by preferring the most specific or recent data\n"
         "- Format output as a structured profile with clear section headers\n"
         "- Focus on what is actionable for a B2B pitch\n"
-        "- Write in clear, professional English",
+        "- Write in clear, professional English\n"
+        "- Include a 'Strategic Pivots & Recent Signals' section with 3-5 specific facts\n"
+        "- Include a 'Competitive Gaps & Weaknesses' section with evidence-backed observations",
     ),
     ("human", "Raw extractions from multiple sources about the target company:\n\n{extractions}"),
 ])
 
 
 def _classic_research(company_name: str, another_url: str) -> str:
-    """Original parallel-crawler implementation. Returns consolidated profile text."""
+    """Parallel-crawler implementation with expanded query set. Returns consolidated profile."""
     tavily_client = get_tavily_client()
     llm = get_llm()
     text_splitter = get_text_splitter()
 
     queries = [
-        f"{company_name} company overview history mission",
+        f"{company_name} company overview history mission size",
         f"{company_name} annual report business strategy 2024 2025",
-        f"{company_name} digital transformation technology challenges",
-        f"{company_name} contact email staff directory",
-        f"{company_name} software IT systems technology stack",
-        f"{company_name} industry competitors market position",
-        f"{company_name} news expansion growth investment",
+        f"{company_name} digital transformation technology challenges problems",
+        f"{company_name} contact email team directory CTO VP director",
+        f"{company_name} software IT systems technology stack vendors",
+        f"{company_name} industry competitors market share competition",
+        f"{company_name} news expansion growth investment funding 2024",
+        # v2 additions — insight and competitive intelligence
+        f"{company_name} problems failures discontinued product pivot restructure",
+        f"{company_name} vs competitor losing market share falling behind",
+        f"{company_name} CTO CEO director email LinkedIn contact",
     ]
 
     def _fetch_urls(query: str) -> List[str]:
@@ -281,25 +339,23 @@ def get_company_information(
     """
     Research *company_name* on the web and return a structured intelligence profile.
 
-    Uses the agentic ReAct loop (Anthropic) when possible; falls back to the
-    classic parallel-crawler approach when only OpenAI is configured.
-
-    Parameters
+    v2 changes
     ----------
-    company_name : target company to research
-    another_url  : optional additional URL to include in research
-    on_tool_call : optional callback(tool_name, tool_inputs) for progress
-                   tracking in the UI (only fires in agentic mode)
+    - Research prompt now explicitly hunts for strategic pivots, failures, and
+      competitive gaps (the "insight" layer that makes proposals feel researched)
+    - All extracted emails are scored by contact_scorer and appended to the
+      profile as a ranked, role-annotated contact table
+    - Generic emails (info@, support@) are flagged and ranked last
+    - max_iterations increased from 12 → 15
 
     Returns
     -------
     (profile_text, email_list)
-        profile_text : structured company profile as a plain string
-        email_list   : deduplicated list of discovered email addresses
+        profile_text : structured company profile including scored contact table
+        email_list   : viable emails only, ranked best-first by decision-maker score
     """
     logger.info("Starting research on: %s", company_name)
 
-    # ── Choose research path ───────────────────────────────────────────────
     use_agentic = bool(ANTHROPIC_API_KEY) and LLM_PROVIDER == "anthropic"
 
     if use_agentic:
@@ -332,20 +388,46 @@ def get_company_information(
             f"Financial Highlights: {company.financial_highlights}",
             f"Sales / Key Contacts: {company.sales_staff_info}",
             f"Contact Information: {company.contact_information}",
-            "",
-            f"Executive Summary: {company.summary}",
         ]
+
+        # v2: add insight and competitive gap sections if available
+        if company.key_insights:
+            profile_lines += ["", "=== KEY INSIGHTS (Proposal Hooks) ===", company.key_insights]
+        if company.competitive_gaps:
+            profile_lines += ["", "=== COMPETITIVE GAPS ===", company.competitive_gaps]
+
+        profile_lines += ["", f"Executive Summary: {company.summary}"]
+
         profile = "\n".join(profile_lines)
-        email_list = list(set(company.email))
+        raw_emails = list(set(company.email))
     except Exception as exc:
         logger.warning("Structured consolidation failed, using raw report: %s", exc)
         profile = raw_report
-        email_list = []
+        raw_emails = []
 
     # ── Augment emails with regex scan over the full report ───────────────
     email_pattern = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
     regex_emails = re.findall(email_pattern, raw_report)
-    email_list = list(set(email_list + regex_emails))
+    all_emails = list(set(raw_emails + regex_emails))
 
-    logger.info("Research complete. Found %d email address(es).", len(email_list))
-    return profile, email_list
+    # ── Score and rank contacts ───────────────────────────────────────────
+    scored = score_contacts(all_emails)
+    viable_emails = [c.email for c in scored if c.is_viable]
+    all_contact_emails = [c.email for c in scored]  # includes blacklisted for display
+
+    # Append a scored contact table to the profile so the UI can surface it
+    if scored:
+        contact_table_lines = ["", "=== CONTACT QUALITY SCORES ==="]
+        for c in scored:
+            status = "✓ VIABLE" if c.is_viable else "✗ FILTERED"
+            contact_table_lines.append(
+                f"{c.badge} [{c.tier_label}] {c.email}  (role: {c.role}, score: {c.score}/100) — {status}"
+            )
+        profile += "\n" + "\n".join(contact_table_lines)
+
+    logger.info(
+        "Research complete. %d total emails, %d viable.",
+        len(all_emails),
+        len(viable_emails),
+    )
+    return profile, viable_emails

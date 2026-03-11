@@ -1,38 +1,41 @@
 # ─────────────────────────────────────────────────────────────
 # TAS AutoBD — Python Dependencies
 # Install with:  pip install -r requirements.txt
+# Python 3.10+ required
 # ─────────────────────────────────────────────────────────────
 
 # ── Environment & Configuration ───────────────────────────────
 python-dotenv>=1.0.0
 
 # ── LLM & LangChain ──────────────────────────────────────────
-langchain>=0.2.0
-langchain-core>=0.2.0
-langchain-openai>=0.1.0
-langchain-community>=0.2.0
-langchain-experimental>=0.0.60
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-text-splitters>=0.3.0
+langchain-anthropic>=0.3.0
+langchain-openai>=0.2.0
+langchain-community>=0.3.0
 
-# ── OpenAI ────────────────────────────────────────────────────
-openai>=1.30.0
-tiktoken>=0.7.0
+# ── LLM Providers ─────────────────────────────────────────────
+anthropic>=0.49.0
+openai>=1.68.0
+tiktoken>=0.9.0
 
 # ── Vector Stores ─────────────────────────────────────────────
-faiss-cpu>=1.8.0
+faiss-cpu>=1.9.0
 
 # ── Embeddings ────────────────────────────────────────────────
-sentence-transformers>=3.0.0
-huggingface-hub>=0.23.0
+sentence-transformers>=3.4.0
+huggingface-hub>=0.29.0
 
 # ── Web Search & Crawling ─────────────────────────────────────
-tavily-python>=0.3.0
-requests>=2.31.0
-aiohttp>=3.9.0
+tavily-python>=0.5.0
+requests>=2.32.0
+aiohttp>=3.11.0
 beautifulsoup4>=4.12.0
-lxml>=5.0.0
+lxml>=5.3.0
 
 # ── UI ────────────────────────────────────────────────────────
-streamlit>=1.35.0
+streamlit>=1.42.0
 
 # ── Email ─────────────────────────────────────────────────────
 sendgrid>=6.11.0
@@ -45,13 +48,13 @@ ipykernel>=6.29.0
 ipywidgets>=8.1.0
 
 # ── Utilities ─────────────────────────────────────────────────
-Pillow>=10.3.0
-pydantic>=2.7.0
-regex>=2024.5.15
+Pillow>=11.1.0
+pydantic>=2.10.0
+regex>=2024.11.6
 
 # ── Optional: GPU-accelerated FAISS (comment out faiss-cpu above if using) ──
 # faiss-gpu>=1.7.4
 
-# ── Optional: PyTorch (only needed if running on GPU) ─────────
-# torch>=2.3.0
-# torchvision>=0.18.0
+# ── Optional: PyTorch (only needed for GPU embeddings) ─────────
+# torch>=2.6.0
+# torchvision>=0.21.0

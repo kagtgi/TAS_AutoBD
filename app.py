@@ -136,19 +136,22 @@ st.markdown(
 def _render_sidebar() -> None:
     with st.sidebar:
         st.markdown("## 🚀 TAS AutoBD")
-        st.markdown("*Agentic LLM Business Development*")
+        st.markdown("*Agentic AI Business Development*")
         st.divider()
 
         # API key status
         st.markdown("### API Status")
         cfg = validate_config()
         icons = {True: "🟢", False: "🔴"}
-        st.markdown(f"{icons[cfg['openai']]} **OpenAI** — {'Configured' if cfg['openai'] else 'Missing'}")
-        st.markdown(f"{icons[cfg['tavily']]} **Tavily** — {'Configured' if cfg['tavily'] else 'Missing'}")
-        st.markdown(f"{icons[cfg['sendgrid']]} **SendGrid** — {'Configured' if cfg['sendgrid'] else 'Missing'}")
+
+        provider = cfg["provider"].capitalize()
+        model = cfg["model"]
+        st.markdown(f"{icons[cfg['llm']]} **{provider}** ({model}) — {'Configured' if cfg['llm'] else 'Missing'}")
+        st.markdown(f"{icons[cfg['tavily']]} **Tavily Search** — {'Configured' if cfg['tavily'] else 'Missing'}")
+        st.markdown(f"{icons[cfg['sendgrid']]} **SendGrid Email** — {'Configured' if cfg['sendgrid'] else 'Missing (optional)'}")
         st.markdown(f"{icons[cfg['github']]} **GitHub Token** — {'Configured' if cfg['github'] else 'Anonymous (60 req/hr)'}")
 
-        if not all([cfg["openai"], cfg["tavily"]]):
+        if not all([cfg["llm"], cfg["tavily"]]):
             st.warning("Add missing API keys to your `.env` file and restart.")
 
         st.divider()
@@ -175,7 +178,7 @@ def _render_sidebar() -> None:
                 st.rerun()
 
         st.divider()
-        st.caption("© 2024 TAS Design Group Inc.")
+        st.caption("© 2025 TAS Design Group Inc.")
 
 
 # ── Session state initialisation ──────────────────────────────────────────────
@@ -205,7 +208,7 @@ def _step1() -> None:
     st.subheader("Step 1 — Research Target Company")
     st.markdown(
         "Enter the name of the company you want to pitch to. "
-        "AutoBD will crawl the web and build a structured profile."
+        "AutoBD will crawl the web and build a structured intelligence profile."
     )
 
     company_name = st.text_input(
@@ -214,7 +217,7 @@ def _step1() -> None:
         placeholder="e.g. Toyota, Panasonic, Rakuten …",
     )
     additional_url = st.text_input(
-        "Additional URL (optional — e.g. company website)",
+        "Additional URL (optional — e.g. company website or press release)",
         value=st.session_state.additional_url,
         placeholder="https://www.example.com",
     )
@@ -226,22 +229,25 @@ def _step1() -> None:
             return
 
         cfg = validate_config()
-        if not cfg["openai"] or not cfg["tavily"]:
-            st.error("OpenAI and Tavily API keys are required. Check the sidebar.")
+        if not cfg["llm"] or not cfg["tavily"]:
+            st.error(
+                f"{cfg['provider'].capitalize()} API key and Tavily API key are required. "
+                "Check the sidebar and your .env file."
+            )
             return
 
         st.session_state.company_name = company_name.strip()
         st.session_state.additional_url = additional_url.strip()
 
-        with st.spinner("🔎 Crawling the web for company information …"):
+        with st.spinner("🔎 Crawling the web for company intelligence …"):
             try:
                 from get_info import get_company_information
 
-                info, emails = get_company_information(
+                characteristics, emails = get_company_information(
                     st.session_state.company_name,
                     st.session_state.additional_url,
                 )
-                st.session_state.characteristics = info.content
+                st.session_state.characteristics = characteristics
                 st.session_state.email_list = emails
                 st.session_state.step = 2
                 st.session_state.processing_error = None
@@ -258,15 +264,15 @@ def _step2() -> None:
     st.markdown('<div class="step-card">', unsafe_allow_html=True)
     st.subheader(f"Step 2 — Company Profile: {st.session_state.company_name}")
     st.markdown(
-        "Review the extracted characteristics. Edit if needed, then click "
+        "Review the extracted intelligence profile. Edit if needed, then click "
         "**Generate Idea** to produce a tailored product hypothesis."
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
     characteristics = st.text_area(
-        "Company Characteristics",
+        "Company Intelligence Profile",
         value=st.session_state.characteristics,
-        height=300,
+        height=350,
         help="This profile was automatically extracted from public web sources.",
     )
     if characteristics != st.session_state.characteristics:
@@ -288,14 +294,12 @@ def _step2() -> None:
             st.error("Characteristics are empty. Please run Step 1 first.")
             return
 
-        with st.spinner("🤔 Analysing characteristics and generating product idea …"):
+        with st.spinner("🤔 Analysing profile and generating product idea …"):
             try:
                 from get_hypo import get_hypothesis_idea
 
-                idea, keywords = run_async(
-                    get_hypothesis_idea(st.session_state.characteristics)
-                )
-                st.session_state.idea = idea.content
+                idea_text, keywords = get_hypothesis_idea(st.session_state.characteristics)
+                st.session_state.idea = idea_text
                 st.session_state.keywords = keywords
                 st.session_state.step = 3
                 st.session_state.processing_error = None
@@ -343,7 +347,7 @@ def _step3() -> None:
             st.error("Idea is empty.")
             return
 
-        with st.spinner("🏗️ Building knowledge base from GitHub & web (this takes a minute) …"):
+        with st.spinner("🏗️ Building knowledge base from GitHub & web (this takes 1-2 minutes) …"):
             try:
                 from make_db import make_db
 
@@ -467,7 +471,7 @@ def main() -> None:
 
     st.title("🚀 TAS AutoBD")
     st.markdown(
-        "*Automated Business Development — powered by agentic LLM pipelines*"
+        "*Automated Business Development — powered by agentic AI pipelines*"
     )
     st.divider()
 

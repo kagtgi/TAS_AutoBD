@@ -13,110 +13,113 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple
 
 from pydantic import BaseModel, Field
-from langchain.prompts import PromptTemplate
-from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.document_loaders import WebBaseLoader
 
 from config import (
     get_llm,
     get_text_splitter,
-    get_semantic_splitter,
     get_tavily_client,
 )
 
 logger = logging.getLogger(__name__)
 
+
 # ── Pydantic schema for extracted company data ────────────────────────────────
 
 class Company(BaseModel):
     name: str = Field(description="Company name")
-    email: List[str] = Field(default_factory=list, description="Company email addresses")
-    general_information: str = Field(description="General information about the company")
-    current_needs: str = Field(description="What the company currently needs")
-    lacking_areas: str = Field(description="Areas where the company is lacking or could improve")
-    sales_staff_info: str = Field(default="", description="Sales staff information")
-    contact_information: str = Field(default="", description="Contact page information")
-    software_production: str = Field(default="", description="Software or IT production info")
-    industry_information: str = Field(description="Industry and market information")
-    financial_highlights: str = Field(default="", description="Financial highlights")
-    summary: str = Field(description="Short summary suitable for business development")
+    email: List[str] = Field(default_factory=list, description="Company email addresses found")
     website: str = Field(default="", description="Company website URL")
     phone_number: str = Field(default="", description="Company phone number")
+    general_information: str = Field(description="General background, founding story, size, and key facts")
+    industry_information: str = Field(description="Industry sector, market position, and competitive landscape")
+    current_needs: str = Field(description="Active business needs, strategic priorities, and growth goals")
+    lacking_areas: str = Field(description="Technology gaps, pain points, and areas ripe for improvement")
+    software_production: str = Field(default="", description="Current software, IT systems, and tech stack in use")
+    financial_highlights: str = Field(default="", description="Revenue, funding rounds, growth metrics, or financial health")
+    sales_staff_info: str = Field(default="", description="Key decision-makers, sales team, or contact persons")
+    contact_information: str = Field(default="", description="Contact details from the company's contact page")
+    summary: str = Field(description="2-3 sentence executive summary highlighting the biggest BD opportunity")
 
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
-_EXTRACT_PROMPT = PromptTemplate(
-    template=(
-        "You are a Senior Business Developer at TAS Design Group Inc. conducting "
-        "market research on a potential customer.\n\n"
-        "Extract the following structured information about the company '{company_name}' "
-        "from the web document below. Translate all content into English.\n\n"
-        "Focus on information relevant to business development:\n"
-        "- Company identity and general background\n"
-        "- Current business needs and pain points\n"
-        "- Technology gaps and lacking areas\n"
-        "- Sales / contact staff emails\n"
-        "- Software or IT systems already in use\n"
-        "- Industry context and competitors\n"
-        "- Financial health indicators\n\n"
-        "{format_instructions}\n\n"
-        "Web document:\n{query}"
+_EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "You are a Senior Business Developer at TAS Design Group Inc., an IT consulting "
+        "and data science company. You are conducting deep market research on a potential "
+        "enterprise client to identify business development opportunities.\n\n"
+        "Your task: extract structured intelligence about the target company from the web "
+        "document provided. Translate all content to English. Focus only on information "
+        "relevant to B2B outreach:\n"
+        "- Company identity, size, and background\n"
+        "- Active business needs and strategic priorities\n"
+        "- Technology gaps and digital transformation challenges\n"
+        "- Email addresses of sales, marketing, or executive staff\n"
+        "- Current software, platforms, and IT infrastructure\n"
+        "- Industry context, competitors, and market position\n"
+        "- Financial health, funding, or growth signals\n\n"
+        "If information is not found in the document, use an empty string. "
+        "Never fabricate data.",
     ),
-    input_variables=["query", "company_name"],
-    partial_variables={},  # filled at call time
-)
+    (
+        "human",
+        "Target company: {company_name}\n\nWeb document:\n{content}",
+    ),
+])
 
-_SUMMARISE_PROMPT = PromptTemplate(
-    template=(
+_SUMMARISE_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
         "You are a Senior Business Developer at TAS Design Group Inc.\n\n"
-        "Below are multiple raw extractions about a single company. "
-        "Consolidate them into a clean, structured profile. "
-        "MUST include the company email(s). "
-        "Format each characteristic on its own line as:\n"
-        "  CharacteristicName: value\n\n"
-        "Raw extractions:\n{query}"
+        "You have collected multiple raw intelligence extracts about a single company from "
+        "different web sources. Your task is to consolidate them into one clean, structured "
+        "company profile.\n\n"
+        "Requirements:\n"
+        "- Merge and deduplicate information across all sources\n"
+        "- Preserve all email addresses found\n"
+        "- Resolve contradictions by preferring the most specific or recent data\n"
+        "- Format output as a structured profile with clear section headers\n"
+        "- Focus on what is actionable for a B2B pitch\n"
+        "- Write in clear, professional English",
     ),
-    input_variables=["query"],
-)
+    (
+        "human",
+        "Raw extractions from multiple sources about the target company:\n\n{extractions}",
+    ),
+])
 
 
 # ── Main function ─────────────────────────────────────────────────────────────
 
 def get_company_information(
     company_name: str, another_url: str = ""
-) -> Tuple[object, List[str]]:
+) -> Tuple[str, List[str]]:
     """
-    Research *company_name* on the web and return:
+    Research *company_name* on the web and return a structured profile.
 
     Returns
     -------
-    (characteristics_message, email_list)
-        characteristics_message : LangChain AIMessage with .content (str)
-        email_list              : deduplicated list of discovered email addresses
+    (profile_text, email_list)
+        profile_text : consolidated company profile as a plain string
+        email_list   : deduplicated list of discovered email addresses
     """
     logger.info("Starting research on: %s", company_name)
     tavily_client = get_tavily_client()
     llm = get_llm()
     text_splitter = get_text_splitter()
 
-    # Try to initialise the semantic splitter; fall back to the basic one if
-    # OpenAI embeddings aren't available (e.g., during testing without API key)
-    try:
-        semantic_splitter = get_semantic_splitter()
-    except Exception:
-        logger.warning("SemanticChunker unavailable – using RecursiveCharacterTextSplitter")
-        semantic_splitter = text_splitter
-
     # ── Step 1: collect URLs ──────────────────────────────────────────────────
     queries = [
-        f"{company_name} company overview",
-        f"{company_name} company information",
-        f"{company_name} current challenges or needs",
-        f"{company_name} contact email staff",
-        f"{company_name} software technology systems",
-        f"{company_name} industry market competitors",
-        f"{company_name} future plans growth",
+        f"{company_name} company overview history mission",
+        f"{company_name} annual report business strategy 2024 2025",
+        f"{company_name} digital transformation technology challenges",
+        f"{company_name} contact email staff directory",
+        f"{company_name} software IT systems technology stack",
+        f"{company_name} industry competitors market position",
+        f"{company_name} news expansion growth investment",
     ]
 
     def _fetch_urls(query: str) -> List[str]:
@@ -140,12 +143,8 @@ def get_company_information(
 
     logger.info("Found %d unique URLs to process", len(web_paths))
 
-    # ── Step 2: extract structured info from each URL ────────────────────────
-    pydantic_parser = PydanticOutputParser(pydantic_object=Company)
-    extract_prompt = _EXTRACT_PROMPT.partial(
-        format_instructions=pydantic_parser.get_format_instructions()
-    )
-    extract_chain = extract_prompt | llm
+    # ── Step 2: extract info from each URL ───────────────────────────────────
+    extract_chain = _EXTRACT_PROMPT | llm
 
     def _process_url(url: str) -> str:
         """Load a URL, chunk if needed, run LLM extraction, return raw text."""
@@ -166,24 +165,23 @@ def get_company_information(
 
             try:
                 if len(content) >= 128_000:
-                    try:
-                        chunks = semantic_splitter.create_documents([content])
-                    except Exception:
-                        chunks = text_splitter.create_documents([content])
+                    chunks = text_splitter.create_documents([content])
                     for chunk in chunks:
                         if time.time() > deadline:
                             break
                         try:
-                            res = extract_chain.invoke(
-                                {"query": chunk.page_content, "company_name": company_name}
-                            )
+                            res = extract_chain.invoke({
+                                "content": chunk.page_content,
+                                "company_name": company_name,
+                            })
                             results.append(res.content)
                         except Exception as exc:
                             logger.debug("Chunk extraction failed: %s", exc)
                 else:
-                    res = extract_chain.invoke(
-                        {"query": content, "company_name": company_name}
-                    )
+                    res = extract_chain.invoke({
+                        "content": content,
+                        "company_name": company_name,
+                    })
                     results.append(res.content)
             except Exception as exc:
                 logger.debug("Document processing failed for %s: %s", url, exc)
@@ -198,16 +196,47 @@ def get_company_information(
             if result:
                 url_results.append(result)
 
-    combined = "\n\n".join(url_results)
-    logger.info("Processed %d URLs; combined text length: %d", len(url_results), len(combined))
+    combined = "\n\n---\n\n".join(url_results)
+    logger.info("Processed %d URLs; combined text length: %d chars", len(url_results), len(combined))
 
-    # ── Step 3: consolidate into one structured profile ───────────────────────
-    summarise_chain = _SUMMARISE_PROMPT | llm
-    characteristics = summarise_chain.invoke({"query": combined})
+    # ── Step 3: use structured output to consolidate into Company profile ─────
+    structured_llm = llm.with_structured_output(Company)
+    try:
+        company: Company = structured_llm.invoke(
+            _SUMMARISE_PROMPT.format_messages(extractions=combined[:60_000])
+        )
+        # Format as a readable profile string
+        profile_lines = [
+            f"Company: {company.name}",
+            f"Website: {company.website}",
+            f"Phone: {company.phone_number}",
+            f"Email(s): {', '.join(company.email) if company.email else 'Not found'}",
+            "",
+            f"General Information: {company.general_information}",
+            f"Industry: {company.industry_information}",
+            f"Current Needs: {company.current_needs}",
+            f"Lacking Areas / Pain Points: {company.lacking_areas}",
+            f"Software & IT Systems: {company.software_production}",
+            f"Financial Highlights: {company.financial_highlights}",
+            f"Sales / Key Contacts: {company.sales_staff_info}",
+            f"Contact Information: {company.contact_information}",
+            "",
+            f"Executive Summary: {company.summary}",
+        ]
+        profile = "\n".join(profile_lines)
+        email_list = list(set(company.email))
+    except Exception as exc:
+        logger.warning("Structured output failed, falling back to text summary: %s", exc)
+        # Fallback: use text summary and regex email extraction
+        summarise_chain = _SUMMARISE_PROMPT | llm
+        result = summarise_chain.invoke({"extractions": combined[:60_000]})
+        profile = result.content
+        email_list = []
 
-    # ── Step 4: extract email addresses ───────────────────────────────────────
+    # ── Step 4: augment emails with regex scan ────────────────────────────────
     email_pattern = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
-    emails = list(set(re.findall(email_pattern, characteristics.content)))
+    regex_emails = re.findall(email_pattern, combined)
+    email_list = list(set(email_list + regex_emails))
 
-    logger.info("Research complete. Found %d email address(es).", len(emails))
-    return characteristics, emails
+    logger.info("Research complete. Found %d email address(es).", len(email_list))
+    return profile, email_list

@@ -14,7 +14,6 @@ Pipeline:
 
 import os
 import csv
-import math
 import time
 import random
 import logging
@@ -23,8 +22,8 @@ from typing import List
 import aiohttp
 import asyncio
 
-from langchain.prompts import PromptTemplate
-from langchain.schema import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import WebBaseLoader
 
@@ -32,7 +31,6 @@ from config import (
     get_llm,
     get_hf_embeddings,
     get_text_splitter,
-    get_semantic_splitter,
     get_tavily_client,
     GITHUB_HEADERS,
     GITHUB_DOWNLOAD_DIR,
@@ -71,6 +69,22 @@ async def _download_zip(session: aiohttp.ClientSession, url: str, dest: str) -> 
         return False
 
 
+async def _download_repo_zip(
+    session: aiohttp.ClientSession, repo_name: str, clone_url: str, dest_path: str
+) -> bool:
+    """
+    Try downloading the repo ZIP from both 'main' and 'master' branches.
+    Returns True if either succeeds.
+    """
+    base_url = clone_url.replace(".git", "")
+    for branch in ("main", "master"):
+        zip_url = f"{base_url}/archive/refs/heads/{branch}.zip"
+        if await _download_zip(session, zip_url, dest_path):
+            return True
+    logger.debug("Could not download zip for %s (tried main & master)", repo_name)
+    return False
+
+
 async def _search_github_keyword(
     session: aiohttp.ClientSession,
     keyword: str,
@@ -82,7 +96,7 @@ async def _search_github_keyword(
     Search GitHub for repositories related to *keyword*, download their ZIPs.
     Uses two date-filtered sub-queries to get both recent and established repos.
     """
-    date_filters = ["created:<=2024-03-31", "created:>=2022-01-01"]
+    date_filters = ["created:>=2023-01-01", "created:<=2023-12-31 stars:>10"]
 
     for date_filter in date_filters:
         query = f"{keyword} {date_filter} stars:>5"
@@ -105,11 +119,10 @@ async def _search_github_keyword(
             if not clone_url:
                 continue
 
-            zip_url = clone_url.replace(".git", "/archive/refs/heads/master.zip")
             file_name = repo_name.replace("/", "#") + ".zip"
             dest_path = os.path.join(output_folder, file_name)
 
-            tasks.append(_download_zip(session, zip_url, dest_path))
+            tasks.append(_download_repo_zip(session, repo_name, clone_url, dest_path))
             row_buffer.append([item["owner"]["login"], item["name"], clone_url, "queued"])
 
         results = await asyncio.gather(*tasks)
@@ -125,26 +138,53 @@ async def _search_github_keyword(
 
 # ── Tavily helpers ────────────────────────────────────────────────────────────
 
-def _fetch_web_docs(keywords: List[str], llm, text_splitter, semantic_splitter) -> List[str]:
+_WEB_SUMMARISE_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "You are a Senior Business Developer at TAS Design Group Inc. preparing research "
+        "for a client proposal. Summarise the key insights from the web article below.\n\n"
+        "Focus on:\n"
+        "1. The core problem this technology/product/approach solves\n"
+        "2. The technical approach and key capabilities\n"
+        "3. Measurable business outcomes, ROI, or performance metrics\n"
+        "4. Real-world adoption or case studies mentioned\n\n"
+        "Keep the summary concise (150-250 words). Translate everything to English. "
+        "Avoid marketing fluff — stick to facts and concrete benefits.",
+    ),
+    (
+        "human",
+        "{content}",
+    ),
+])
+
+_REPO_SUMMARISE_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "You are a Business Developer at TAS Design Group Inc. analysing open-source "
+        "repositories to gather evidence for a client proposal.\n\n"
+        "Extract and summarise the key information with a business focus:\n"
+        "1. Core problem the project solves and its solution approach\n"
+        "2. Key technical capabilities and architecture\n"
+        "3. Adoption signals (stars, contributors, production use cases)\n"
+        "4. Business benefits and measurable outcomes if mentioned\n"
+        "5. Integration complexity and deployment requirements\n\n"
+        "Keep the summary concise (150-250 words). "
+        "Do NOT include source code. Focus on business relevance.",
+    ),
+    (
+        "human",
+        "{content}",
+    ),
+])
+
+
+def _fetch_web_docs(keywords: List[str], llm, text_splitter) -> List[str]:
     """
     Search Tavily for web pages related to each keyword, load and
     summarise them. Returns a list of summary strings.
     """
     tavily_client = get_tavily_client()
-    summarise_prompt = PromptTemplate(
-        template=(
-            "You are a Senior Business Developer at TAS Design Group Inc.\n"
-            "Summarise the key ideas from this web article for later use in a "
-            "business proposal. Focus on:\n"
-            "- The core problem solved\n"
-            "- The technology or approach used\n"
-            "- Measurable benefits or outcomes\n"
-            "Translate everything into English.\n\n"
-            "{query}"
-        ),
-        input_variables=["query"],
-    )
-    summarise_chain = summarise_prompt | llm
+    summarise_chain = _WEB_SUMMARISE_PROMPT | llm
 
     urls_seen = set()
     summaries: List[str] = []
@@ -152,7 +192,7 @@ def _fetch_web_docs(keywords: List[str], llm, text_splitter, semantic_splitter) 
     for keyword in keywords[:3]:
         try:
             response = tavily_client.search(
-                f"product or research about: {keyword}",
+                f"product use case or research about: {keyword}",
                 search_depth="advanced",
                 topic="general",
                 max_results=2,
@@ -182,17 +222,14 @@ def _fetch_web_docs(keywords: List[str], llm, text_splitter, semantic_splitter) 
                 deadline = time.time() + 20
                 try:
                     if len(content) >= 128_000:
-                        try:
-                            chunks = semantic_splitter.create_documents([content])
-                        except Exception:
-                            chunks = text_splitter.create_documents([content])
+                        chunks = text_splitter.create_documents([content])
                         for chunk in chunks:
                             if time.time() > deadline:
                                 break
-                            result_text = summarise_chain.invoke(chunk.page_content)
+                            result_text = summarise_chain.invoke({"content": chunk.page_content})
                             summaries.append(result_text.content)
                     else:
-                        result_text = summarise_chain.invoke(content)
+                        result_text = summarise_chain.invoke({"content": content})
                         summaries.append(result_text.content)
                 except Exception as exc:
                     logger.debug("Summarisation failed for %s: %s", url, exc)
@@ -218,11 +255,6 @@ async def make_db(idea: str, keywords: List[str]):
     logger.info("Building knowledge database for keywords: %s", keywords)
     llm = get_llm()
     text_splitter = get_text_splitter()
-    try:
-        semantic_splitter = get_semantic_splitter()
-    except Exception:
-        logger.warning("SemanticChunker unavailable — using basic splitter")
-        semantic_splitter = text_splitter
 
     os.makedirs(GITHUB_DOWNLOAD_DIR, exist_ok=True)
     csv_path = os.path.join(DATA_DIR, "repositories.csv")
@@ -249,32 +281,17 @@ async def make_db(idea: str, keywords: List[str]):
     logger.info("Extracted %d README texts from downloaded repos.", len(all_texts))
 
     # ── Phase 3: Fetch & summarise web articles ───────────────────────────────
-    web_summaries = _fetch_web_docs(keywords, llm, text_splitter, semantic_splitter)
+    web_summaries = _fetch_web_docs(keywords, llm, text_splitter)
     all_texts.extend(web_summaries)
     logger.info("Total raw texts (READMEs + web): %d", len(all_texts))
 
     # ── Phase 4: Summarise all texts for the vector store ────────────────────
-    repo_summarise_prompt = PromptTemplate(
-        template=(
-            "You are a Business Developer at TAS Design Group Inc. analysing "
-            "open-source repositories and articles to support a business proposal.\n\n"
-            "Extract and summarise the key information with a human-impact focus:\n"
-            "1. Core problem the project solves and its solution approach.\n"
-            "2. Ethical technologies used (privacy, security, transparency).\n"
-            "3. Accessibility and inclusivity features.\n"
-            "4. Long-term societal or environmental impact.\n"
-            "5. Concrete metrics or outcomes if mentioned.\n"
-            "Do NOT include source code. Keep output concise and business-relevant.\n\n"
-            "{query}"
-        ),
-        input_variables=["query"],
-    )
-    repo_chain = repo_summarise_prompt | llm
+    repo_chain = _REPO_SUMMARISE_PROMPT | llm
 
     random.shuffle(all_texts)
     final_docs: List[Document] = []
     processed = 0
-    max_docs = 15  # cap to keep latency reasonable
+    max_docs = 20  # cap to keep latency reasonable
 
     for text in all_texts:
         if processed >= max_docs:
@@ -285,18 +302,15 @@ async def make_db(idea: str, keywords: List[str]):
         deadline = time.time() + 30
         try:
             if len(text) >= 128_000:
-                try:
-                    chunks = semantic_splitter.create_documents([text])
-                except Exception:
-                    chunks = text_splitter.create_documents([text])
+                chunks = text_splitter.create_documents([text])
                 for chunk in chunks:
                     if time.time() > deadline:
                         break
-                    summary = repo_chain.invoke(chunk.page_content)
+                    summary = repo_chain.invoke({"content": chunk.page_content})
                     final_docs.append(Document(page_content=summary.content))
                     processed += 1
             else:
-                summary = repo_chain.invoke(text)
+                summary = repo_chain.invoke({"content": text})
                 final_docs.append(Document(page_content=summary.content))
                 processed += 1
         except Exception as exc:

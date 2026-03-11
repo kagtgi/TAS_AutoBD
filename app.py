@@ -1,42 +1,47 @@
 """
-TAS AutoBD — Streamlit Application
-=====================================
+TAS AutoBD — Streamlit Application (v2)
+========================================
 Agentic LLM-powered automatic business development tool.
-Guides the user through a 4-step wizard:
 
-  Step 1 → Autonomous research of target company (ReAct agent)
-  Step 2 → Review profile & generate product idea
-  Step 3 → Build knowledge DB & generate proposal (with self-reflection)
-  Step 4 → Review & send HTML email proposal
+v2 UI improvements
+-------------------
+1. Contact Quality Panel   — shows scored/ranked contacts with role badges.
+   Generic emails (info@, support@) are visually flagged as low-quality.
+2. Insight Highlights      — surfaces the key_insights and competitive_gaps
+   sections from research as highlighted callouts, not buried in a text block.
+3. Outcome Tracker         — simple "did this lead respond?" toggle after send,
+   stored in ./data/outcomes.json so quality can be measured over time.
+4. Pre-send Deliverability Warning — warns if the only available email is a
+   generic/filtered address before sending.
 
 Run with:
     streamlit run app.py
 """
 
+import json
 import logging
 import os
+from pathlib import Path
 
 import streamlit as st
 
-# ── Third-party async compat (needed for Streamlit + asyncio) ─────────────────
 try:
     import nest_asyncio
     nest_asyncio.apply()
 except ImportError:
     pass
 
-# ── Local imports ─────────────────────────────────────────────────────────────
-from config import validate_config
+from config import validate_config, DATA_DIR
 from utils import clean_html_fences
 from email_utils import send_email, add_email_manually
-
-# Pipeline agents imported lazily inside handlers to keep startup fast
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+OUTCOMES_FILE = os.path.join(DATA_DIR, "outcomes.json")
 
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -104,8 +109,27 @@ st.markdown(
         padding: 1rem 1.5rem;
         margin-bottom: 1rem;
     }
-    .badge-ok   { color: #16a34a; font-weight: bold; }
-    .badge-warn { color: #dc2626; font-weight: bold; }
+    .insight-card {
+        background: #FFF8E1;
+        border-left: 4px solid #F59E0B;
+        border-radius: 8px;
+        padding: 0.8rem 1.2rem;
+        margin-bottom: 0.8rem;
+    }
+    .gap-card {
+        background: #FEF2F2;
+        border-left: 4px solid #EF4444;
+        border-radius: 8px;
+        padding: 0.8rem 1.2rem;
+        margin-bottom: 0.8rem;
+    }
+    .contact-exec   { color: #16a34a; font-weight: bold; }
+    .contact-tech   { color: #2563eb; font-weight: bold; }
+    .contact-biz    { color: #7c3aed; font-weight: bold; }
+    .contact-gen    { color: #6b7280; }
+    .contact-bad    { color: #dc2626; text-decoration: line-through; }
+    .badge-ok       { color: #16a34a; font-weight: bold; }
+    .badge-warn     { color: #dc2626; font-weight: bold; }
     .tool-log-entry {
         font-family: monospace;
         font-size: 0.85rem;
@@ -116,6 +140,47 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+# ── Outcome tracking ───────────────────────────────────────────────────────────
+
+def _load_outcomes() -> list:
+    try:
+        if os.path.exists(OUTCOMES_FILE):
+            with open(OUTCOMES_FILE) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+
+def _save_outcome(company: str, email: str, responded: bool) -> None:
+    outcomes = _load_outcomes()
+    outcomes.append({
+        "company": company,
+        "email": email,
+        "responded": responded,
+        "timestamp": __import__("datetime").datetime.utcnow().isoformat(),
+    })
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(OUTCOMES_FILE, "w") as f:
+            json.dump(outcomes, f, indent=2)
+    except Exception as exc:
+        logger.warning("Could not save outcome: %s", exc)
+
+
+def _render_outcomes_summary() -> None:
+    outcomes = _load_outcomes()
+    if not outcomes:
+        return
+    total = len(outcomes)
+    responded = sum(1 for o in outcomes if o.get("responded"))
+    rate = responded / total * 100 if total else 0
+    st.markdown(
+        f"📊 **Pipeline:** {total} proposals sent · {responded} responses · "
+        f"**{rate:.0f}% response rate**"
+    )
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -143,10 +208,10 @@ def _render_sidebar() -> None:
         st.divider()
         st.markdown("### How it works")
         steps = [
-            ("1️⃣", "Agent researches company autonomously"),
-            ("2️⃣", "Review profile & generate idea"),
-            ("3️⃣", "Build knowledge base & draft proposal"),
-            ("4️⃣", "Review, refine & send email"),
+            ("1️⃣", "Agent researches company + competitive gaps"),
+            ("2️⃣", "Review insights & gap analysis, generate idea"),
+            ("3️⃣", "Build knowledge base & draft evidence-backed proposal"),
+            ("4️⃣", "Review, refine & send to ranked contacts"),
         ]
         for icon, label in steps:
             st.markdown(f"{icon} {label}")
@@ -162,6 +227,8 @@ def _render_sidebar() -> None:
                     del st.session_state[key]
                 st.rerun()
 
+        st.divider()
+        _render_outcomes_summary()
         st.divider()
         st.caption("© 2025 TAS Design Group Inc.")
 
@@ -180,14 +247,14 @@ def _init_state() -> None:
         "docsearch": None,
         "email_proposal": "",
         "processing_error": None,
-        "agent_tool_log": [],   # list of {"tool": str, "inputs": dict}
+        "agent_tool_log": [],
     }
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
 
 
-# ── Agent tool-call log widget ─────────────────────────────────────────────────
+# ── Tool log widget ───────────────────────────────────────────────────────────
 
 _TOOL_ICONS = {
     "web_search": "🔍",
@@ -199,7 +266,6 @@ _TOOL_ICONS = {
 
 
 def _render_tool_log(log: list) -> None:
-    """Display the agent's tool-call history in a collapsible expander."""
     if not log:
         return
     label = f"🤖 Agent used **{len(log)} tool calls** to research this company"
@@ -208,7 +274,6 @@ def _render_tool_log(log: list) -> None:
             tool = entry.get("tool", "unknown")
             inputs = entry.get("inputs", {})
             icon = _TOOL_ICONS.get(tool, "🔧")
-            # Pick the most descriptive input field for display
             detail = (
                 inputs.get("query")
                 or inputs.get("url")
@@ -223,15 +288,118 @@ def _render_tool_log(log: list) -> None:
             )
 
 
+# ── Insight & gap highlights ──────────────────────────────────────────────────
+
+def _extract_section(profile: str, section_header: str) -> str:
+    """Extract a named === SECTION === block from the profile text."""
+    pattern = rf"===\s*{re.escape(section_header)}\s*===\s*\n(.*?)(?====|\Z)"
+    import re as _re
+    m = _re.search(pattern, profile, _re.DOTALL | _re.IGNORECASE)
+    return m.group(1).strip() if m else ""
+
+
+def _render_insight_panel(profile: str) -> None:
+    """Show key insights and competitive gaps as highlighted cards."""
+    import re as _re
+
+    insights = _extract_section(profile, "KEY INSIGHTS (Proposal Hooks)")
+    gaps = _extract_section(profile, "COMPETITIVE GAPS")
+
+    if not insights and not gaps:
+        return
+
+    st.markdown("---")
+    if insights:
+        st.markdown(
+            '<div class="insight-card">'
+            '<b>💡 Key Insights (Proposal Hooks)</b><br>'
+            + insights.replace("\n", "<br>")
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+    if gaps:
+        st.markdown(
+            '<div class="gap-card">'
+            '<b>⚠️ Competitive Gaps</b><br>'
+            + gaps.replace("\n", "<br>")
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+    st.markdown("---")
+
+
+# ── Contact quality panel ─────────────────────────────────────────────────────
+
+def _render_contact_panel(profile: str, email_list: list) -> None:
+    """
+    Parse and display the scored contact table from the profile.
+    Shows role badges and highlights generic/filtered addresses.
+    """
+    import re as _re
+
+    scored_section = _extract_section(profile, "CONTACT QUALITY SCORES")
+
+    if scored_section:
+        with st.expander(f"📇 Contact Quality — {len(email_list)} viable address(es)", expanded=True):
+            for line in scored_section.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if "FILTERED" in line:
+                    css = "contact-bad"
+                elif "Executive" in line:
+                    css = "contact-exec"
+                elif "Technical" in line:
+                    css = "contact-tech"
+                elif "Business" in line:
+                    css = "contact-biz"
+                else:
+                    css = "contact-gen"
+                st.markdown(
+                    f'<div class="{css}" style="font-size:0.9rem;padding:2px 0">{line}</div>',
+                    unsafe_allow_html=True,
+                )
+            if not email_list:
+                st.warning(
+                    "All discovered emails were filtered as generic addresses. "
+                    "Add a decision-maker email manually below."
+                )
+    elif email_list:
+        st.info(f"📧 Found {len(email_list)} email address(es) automatically.")
+    else:
+        st.warning("No email addresses found. Add one manually below.")
+
+
+# ── Pre-send deliverability check ─────────────────────────────────────────────
+
+def _deliverability_check(email: str) -> list[str]:
+    """Return a list of warning strings for a given email, or empty if clean."""
+    warnings = []
+    local = email.split("@")[0].lower() if "@" in email else email.lower()
+    generic_locals = {
+        "info", "contact", "hello", "support", "help", "admin",
+        "webmaster", "noreply", "no-reply", "office", "general",
+    }
+    if local in generic_locals:
+        warnings.append(
+            f"'{email}' looks like a generic inbox. Proposals sent here are rarely read. "
+            "Add a named contact instead."
+        )
+    if not email.endswith((".com", ".org", ".net", ".io", ".co", ".jp", ".vn", ".de", ".uk", ".fr")):
+        warnings.append(f"Unusual email domain in '{email}' — verify before sending.")
+    return warnings
+
+
 # ── Step rendering functions ──────────────────────────────────────────────────
 
 def _step1() -> None:
     st.markdown('<div class="step-card">', unsafe_allow_html=True)
     st.subheader("Step 1 — Research Target Company")
     st.markdown(
-        "Enter the company name. The **autonomous research agent** will decide "
-        "what to search for, which pages to fetch, and when it has enough "
-        "intelligence — no fixed query templates."
+        "Enter the company name. The **autonomous research agent** will:\n"
+        "- Gather deep company intelligence across 7 research phases\n"
+        "- **Hunt for strategic pivots, competitive losses, and recent signals** (the insight layer)\n"
+        "- Rank and score all discovered contacts by decision-maker likelihood"
     )
 
     company_name = st.text_input(
@@ -266,10 +434,9 @@ def _step1() -> None:
         tool_log: list = []
 
         def _on_tool_call(tool_name: str, tool_inputs: dict) -> None:
-            """Collect each tool call for display after research completes."""
             tool_log.append({"tool": tool_name, "inputs": tool_inputs})
 
-        with st.spinner("🤖 Autonomous research agent working … (≈ 45–60 s)"):
+        with st.spinner("🤖 Autonomous research agent working … (≈ 60–90 s — deeper research in v2)"):
             try:
                 from get_info import get_company_information
 
@@ -296,25 +463,27 @@ def _step2() -> None:
     st.markdown('<div class="step-card">', unsafe_allow_html=True)
     st.subheader(f"Step 2 — Company Profile: {st.session_state.company_name}")
     st.markdown(
-        "Review the extracted intelligence profile. Edit if needed, then click "
-        "**Generate Idea** to produce a tailored product hypothesis."
+        "Review the extracted intelligence. The **Key Insights** and **Competitive Gaps** "
+        "sections are the proposal hooks — they make your outreach feel researched, not templated."
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Show agent tool-call log from Step 1
     _render_tool_log(st.session_state.get("agent_tool_log", []))
 
+    # Show insight highlights as separate callout cards
+    _render_insight_panel(st.session_state.characteristics)
+
+    # Show contact quality panel
+    _render_contact_panel(st.session_state.characteristics, st.session_state.email_list)
+
     characteristics = st.text_area(
-        "Company Intelligence Profile",
+        "Full Company Intelligence Profile",
         value=st.session_state.characteristics,
         height=350,
-        help="Autonomously extracted by the research agent from public web sources.",
+        help="Autonomously extracted by the research agent. Includes insights, competitive gaps, and scored contacts.",
     )
     if characteristics != st.session_state.characteristics:
         st.session_state.characteristics = characteristics
-
-    if st.session_state.email_list:
-        st.info(f"📧 Found {len(st.session_state.email_list)} email address(es) automatically.")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -329,7 +498,7 @@ def _step2() -> None:
             st.error("Characteristics are empty. Please run Step 1 first.")
             return
 
-        with st.spinner("🤔 Analysing profile and generating product idea …"):
+        with st.spinner("🤔 Analysing competitive gap and generating anchored solution …"):
             try:
                 from get_hypo import get_hypothesis_idea
 
@@ -348,19 +517,20 @@ def _step2() -> None:
 
 def _step3() -> None:
     st.markdown('<div class="step-card">', unsafe_allow_html=True)
-    st.subheader("Step 3 — Product Idea & Knowledge Base")
+    st.subheader("Step 3 — Competitive Gap Analysis & Solution")
     st.markdown(
-        "Review the generated idea. Edit if needed, then click **Generate Proposal** "
-        "to build the knowledge base and draft the email. "
-        "The proposal agent will **self-critique and refine** its draft before presenting it."
+        "The idea now includes a **competitive gap analysis** stage — the solution is anchored "
+        "to a specific, evidence-backed weakness, not generic company needs.\n\n"
+        "The proposal will enforce an **insight hook** in the opening and require evidence "
+        "citations for all metrics. Self-critique runs up to **3 passes** (raised from 1)."
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
     idea = st.text_area(
-        "Product Idea",
+        "Competitive Gap Analysis + Product Idea",
         value=st.session_state.idea,
-        height=250,
-        help="AI-generated product hypothesis based on the company profile.",
+        height=300,
+        help="v2: includes gap analysis stage before the solution proposal.",
     )
     if idea != st.session_state.idea:
         st.session_state.idea = idea
@@ -394,7 +564,7 @@ def _step3() -> None:
                 st.error(f"Knowledge base build failed: {exc}")
                 return
 
-        with st.spinner("✍️ Drafting proposal and running self-critique …"):
+        with st.spinner("✍️ Drafting evidence-backed proposal and running multi-pass critique …"):
             try:
                 from get_proposal import make_proposal
 
@@ -418,8 +588,9 @@ def _step4() -> None:
     st.markdown('<div class="step-card">', unsafe_allow_html=True)
     st.subheader(f"Step 4 — Review & Send Proposal to {st.session_state.company_name}")
     st.markdown(
-        "Review the quality-reviewed HTML proposal below. Edit directly if needed, "
-        "then select a recipient and click **Send Email**."
+        "Review the quality-reviewed HTML proposal. "
+        "Recipients are **ranked by decision-maker score** — executives first, "
+        "generic inboxes filtered out."
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -454,13 +625,19 @@ def _step4() -> None:
     st.session_state.email_list = add_email_manually(st.session_state.email_list)
 
     if not st.session_state.email_list:
-        st.warning("No email addresses found. Add one manually above.")
+        st.warning("No viable email addresses found. Add a decision-maker email manually above.")
     else:
         selected_email = st.selectbox(
-            "Recipient",
+            "Recipient (ranked by decision-maker score — best first)",
             options=st.session_state.email_list,
             key="selected_email",
         )
+
+        # Pre-send deliverability check
+        if selected_email:
+            warnings = _deliverability_check(selected_email)
+            for w in warnings:
+                st.warning(f"⚠️ {w}")
 
         col1, col2 = st.columns(2)
         with col1:
@@ -486,14 +663,42 @@ def _step4() -> None:
             if success:
                 st.success(f"✅ Email sent successfully to **{selected_email}**!")
                 st.balloons()
-                for key in list(st.session_state.keys()):
-                    del st.session_state[key]
-                st.rerun()
+
+                # Outcome tracker
+                st.divider()
+                st.markdown("### 📊 Track Outcome")
+                st.markdown(
+                    "Did this lead respond? Recording outcomes helps measure proposal quality "
+                    "and improves future targeting."
+                )
+                col_yes, col_no, col_skip = st.columns(3)
+                with col_yes:
+                    if st.button("✅ Yes — they responded", use_container_width=True):
+                        _save_outcome(st.session_state.company_name, selected_email, responded=True)
+                        st.success("Outcome recorded.")
+                        for key in list(st.session_state.keys()):
+                            del st.session_state[key]
+                        st.rerun()
+                with col_no:
+                    if st.button("❌ No response", use_container_width=True):
+                        _save_outcome(st.session_state.company_name, selected_email, responded=False)
+                        st.info("Outcome recorded.")
+                        for key in list(st.session_state.keys()):
+                            del st.session_state[key]
+                        st.rerun()
+                with col_skip:
+                    if st.button("— Skip", use_container_width=True):
+                        for key in list(st.session_state.keys()):
+                            del st.session_state[key]
+                        st.rerun()
             else:
                 st.error(f"❌ Failed to send email: {message}")
 
 
-# ── Main entry point ──────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+import re  # noqa: E402 — needed by _extract_section
+
 
 def main() -> None:
     _init_state()
@@ -501,7 +706,7 @@ def main() -> None:
 
     st.title("🚀 TAS AutoBD")
     st.markdown(
-        "*Automated Business Development — powered by agentic AI with native tool use*"
+        "*Automated Business Development v2 — insight-first, evidence-backed proposals*"
     )
     st.divider()
 

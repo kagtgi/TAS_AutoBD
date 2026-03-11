@@ -3,6 +3,11 @@ TAS AutoBD — Central Configuration
 ====================================
 All API keys, paths, and model settings are loaded from environment
 variables (via .env file). No credentials are ever hardcoded.
+
+Supported LLM providers:
+  - "anthropic" (default) → Claude claude-sonnet-4-6  (SOTA reasoning)
+  - "openai"              → GPT-4o or any OpenAI model
+Set LLM_PROVIDER in your .env to switch providers.
 """
 
 import os
@@ -17,6 +22,7 @@ load_dotenv(Path(__file__).parent / ".env")
 logger = logging.getLogger(__name__)
 
 # ── API Keys ──────────────────────────────────────────────────────────────────
+ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 TAVILY_API_KEY: str = os.getenv("TAVILY_API_KEY", "")
 SENDGRID_API_KEY: str = os.getenv("SENDGRID_API_KEY", "")
@@ -33,11 +39,11 @@ os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(GITHUB_DOWNLOAD_DIR, exist_ok=True)
 
 # ── Model Configuration ───────────────────────────────────────────────────────
-LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4o")
-LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.7"))
-EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
+LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "anthropic")  # "anthropic" or "openai"
+LLM_MODEL: str = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
+LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 HF_EMBEDDING_MODEL: str = os.getenv(
-    "HF_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+    "HF_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"
 )
 
 # ── GitHub API ────────────────────────────────────────────────────────────────
@@ -52,40 +58,62 @@ if GITHUB_TOKEN:
 
 # ── Lazy Factory Functions ────────────────────────────────────────────────────
 def get_llm():
-    """Return a ChatOpenAI instance using the configured model and key."""
-    from langchain_openai import ChatOpenAI
+    """
+    Return an LLM instance based on LLM_PROVIDER setting.
 
-    if not OPENAI_API_KEY:
-        raise EnvironmentError(
-            "OPENAI_API_KEY is not set. Please add it to your .env file."
+    Default provider is Anthropic (Claude claude-sonnet-4-6).
+    Set LLM_PROVIDER=openai in .env to use OpenAI models instead.
+    """
+    if LLM_PROVIDER == "openai":
+        from langchain_openai import ChatOpenAI
+
+        if not OPENAI_API_KEY:
+            raise EnvironmentError(
+                "OPENAI_API_KEY is not set. Please add it to your .env file."
+            )
+        return ChatOpenAI(
+            model=LLM_MODEL,
+            temperature=LLM_TEMPERATURE,
+            api_key=OPENAI_API_KEY,
         )
-    return ChatOpenAI(
-        model=LLM_MODEL,
-        temperature=LLM_TEMPERATURE,
-        api_key=OPENAI_API_KEY,
-    )
+    else:
+        from langchain_anthropic import ChatAnthropic
+
+        if not ANTHROPIC_API_KEY:
+            raise EnvironmentError(
+                "ANTHROPIC_API_KEY is not set. Please add it to your .env file."
+            )
+        return ChatAnthropic(
+            model=LLM_MODEL,
+            temperature=LLM_TEMPERATURE,
+            api_key=ANTHROPIC_API_KEY,
+        )
 
 
 def get_openai_embeddings():
-    """Return OpenAI embeddings (higher quality, requires API key)."""
+    """Return OpenAI embeddings (higher quality, requires OpenAI API key)."""
     from langchain_openai import OpenAIEmbeddings
 
     if not OPENAI_API_KEY:
         raise EnvironmentError("OPENAI_API_KEY is not set.")
-    return OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=OPENAI_API_KEY)
+    return OpenAIEmbeddings(model="text-embedding-3-small", api_key=OPENAI_API_KEY)
 
 
 def get_hf_embeddings():
-    """Return HuggingFace embeddings (free, no API key required)."""
+    """Return HuggingFace BGE embeddings (free, no API key required)."""
     from langchain_community.embeddings import HuggingFaceEmbeddings
 
-    return HuggingFaceEmbeddings(model_name=HF_EMBEDDING_MODEL)
+    return HuggingFaceEmbeddings(
+        model_name=HF_EMBEDDING_MODEL,
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
 
 
 def get_text_splitter():
     """Return a RecursiveCharacterTextSplitter with tiktoken length function."""
     import tiktoken
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
 
     tokenizer = tiktoken.get_encoding("cl100k_base")
 
@@ -93,8 +121,8 @@ def get_text_splitter():
         return len(tokenizer.encode(text, disallowed_special=()))
 
     return RecursiveCharacterTextSplitter(
-        chunk_size=2800,
-        chunk_overlap=20,
+        chunk_size=3000,
+        chunk_overlap=200,
         length_function=_tiktoken_len,
         separators=["\n\n", "\n", " ", ""],
     )
@@ -102,7 +130,10 @@ def get_text_splitter():
 
 def get_semantic_splitter():
     """Return a SemanticChunker (requires OpenAI embeddings)."""
-    from langchain_experimental.text_splitter import SemanticChunker
+    try:
+        from langchain_experimental.text_splitter import SemanticChunker
+    except ImportError:
+        raise ImportError("Install langchain-experimental: pip install langchain-experimental")
 
     return SemanticChunker(
         get_openai_embeddings(), breakpoint_threshold_type="percentile"
@@ -123,15 +154,30 @@ def get_tavily_client():
 # ── Config Validation ─────────────────────────────────────────────────────────
 def validate_config() -> dict:
     """Return a dict indicating which services are properly configured."""
-    _placeholders = {"your_openai_api_key_here", "your_tavily_api_key_here",
-                     "your_sendgrid_api_key_here", "your_github_token_here", ""}
+    _placeholders = {
+        "your_anthropic_api_key_here",
+        "your_openai_api_key_here",
+        "your_tavily_api_key_here",
+        "your_sendgrid_api_key_here",
+        "your_github_token_here",
+        "",
+    }
 
     def _is_set(val: str) -> bool:
         return bool(val and val not in _placeholders)
 
+    llm_ready = (
+        _is_set(ANTHROPIC_API_KEY) if LLM_PROVIDER == "anthropic"
+        else _is_set(OPENAI_API_KEY)
+    )
+
     return {
+        "llm": llm_ready,
+        "anthropic": _is_set(ANTHROPIC_API_KEY),
         "openai": _is_set(OPENAI_API_KEY),
         "tavily": _is_set(TAVILY_API_KEY),
         "sendgrid": _is_set(SENDGRID_API_KEY),
         "github": _is_set(GITHUB_TOKEN),
+        "provider": LLM_PROVIDER,
+        "model": LLM_MODEL,
     }

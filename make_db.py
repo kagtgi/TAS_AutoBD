@@ -1,26 +1,27 @@
 """
-TAS AutoBD — Knowledge Database Builder
-=========================================
-Downloads relevant GitHub repositories and web articles based on
-the generated keywords, then builds a FAISS vector store for RAG.
+TAS AutoBD — Knowledge Database Builder (v2)
+=============================================
+Downloads relevant GitHub repository READMEs and web articles based on the
+generated keywords, then builds a FAISS vector store for RAG retrieval.
 
-Pipeline:
-  1. Search GitHub for repositories matching each keyword.
-  2. Download ZIP archives and extract README files.
-  3. Search Tavily for web articles about the keywords.
-  4. Summarise all collected documents with an LLM.
-  5. Embed summaries and store them in a FAISS index.
+Pipeline (simplified from v1 — no ZIP downloads)
+-------------------------------------------------
+  1. GitHub search  — find top repos per keyword via the GitHub REST API
+  2. README fetch   — download README.md directly from raw.githubusercontent.com
+                      (parallel, using the tools module; replaces ZIP download)
+  3. Web articles   — Tavily search + WebBaseLoader per keyword
+  4. Summarise      — LLM summarisation of all collected documents (capped at 20)
+  5. FAISS index    — build and return an in-memory vector store
+
+This module is fully synchronous; the async infrastructure from v1 has been
+replaced by ThreadPoolExecutor calls via the tools module.
 """
 
-import os
-import csv
 import time
 import random
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List
-
-import aiohttp
-import asyncio
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
@@ -32,111 +33,12 @@ from config import (
     get_hf_embeddings,
     get_text_splitter,
     get_tavily_client,
-    GITHUB_HEADERS,
-    GITHUB_DOWNLOAD_DIR,
-    DATA_DIR,
 )
-from utils import process_zip_files_to_faiss
 
 logger = logging.getLogger(__name__)
 
-# ── GitHub helpers ────────────────────────────────────────────────────────────
 
-async def _fetch_json(session: aiohttp.ClientSession, url: str) -> dict:
-    """GET *url* and return parsed JSON. Returns {} on error."""
-    try:
-        async with session.get(url, headers=GITHUB_HEADERS, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-            if resp.status == 200:
-                return await resp.json()
-            logger.warning("GitHub API returned %s for %s", resp.status, url)
-            return {}
-    except Exception as exc:
-        logger.warning("HTTP error fetching %s: %s", url, exc)
-        return {}
-
-
-async def _download_zip(session: aiohttp.ClientSession, url: str, dest: str) -> bool:
-    """Download a ZIP file from *url* to *dest*. Returns True on success."""
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-            if resp.status == 200:
-                with open(dest, "wb") as f:
-                    f.write(await resp.read())
-                return True
-            return False
-    except Exception as exc:
-        logger.debug("Download failed %s: %s", url, exc)
-        return False
-
-
-async def _download_repo_zip(
-    session: aiohttp.ClientSession, repo_name: str, clone_url: str, dest_path: str
-) -> bool:
-    """
-    Try downloading the repo ZIP from both 'main' and 'master' branches.
-    Returns True if either succeeds.
-    """
-    base_url = clone_url.replace(".git", "")
-    for branch in ("main", "master"):
-        zip_url = f"{base_url}/archive/refs/heads/{branch}.zip"
-        if await _download_zip(session, zip_url, dest_path):
-            return True
-    logger.debug("Could not download zip for %s (tried main & master)", repo_name)
-    return False
-
-
-async def _search_github_keyword(
-    session: aiohttp.ClientSession,
-    keyword: str,
-    output_folder: str,
-    csv_writer: csv.writer,
-    repos_per_keyword: int = 5,
-) -> None:
-    """
-    Search GitHub for repositories related to *keyword*, download their ZIPs.
-    Uses two date-filtered sub-queries to get both recent and established repos.
-    """
-    date_filters = ["created:>=2023-01-01", "created:<=2023-12-31 stars:>10"]
-
-    for date_filter in date_filters:
-        query = f"{keyword} {date_filter} stars:>5"
-        url = (
-            f"https://api.github.com/search/repositories"
-            f"?q={query}&sort=stars&order=desc&per_page={repos_per_keyword}"
-        )
-        data = await _fetch_json(session, url)
-        items = data.get("items", [])
-
-        if not items:
-            logger.info("No GitHub results for keyword=%r filter=%r", keyword, date_filter)
-            continue
-
-        tasks = []
-        row_buffer = []
-        for item in items:
-            repo_name = item.get("full_name", "")
-            clone_url = item.get("clone_url", "")
-            if not clone_url:
-                continue
-
-            file_name = repo_name.replace("/", "#") + ".zip"
-            dest_path = os.path.join(output_folder, file_name)
-
-            tasks.append(_download_repo_zip(session, repo_name, clone_url, dest_path))
-            row_buffer.append([item["owner"]["login"], item["name"], clone_url, "queued"])
-
-        results = await asyncio.gather(*tasks)
-        for row, ok in zip(row_buffer, results):
-            row[-1] = "downloaded" if ok else "failed"
-        csv_writer.writerows(row_buffer)
-
-        logger.info(
-            "Keyword=%r filter=%r — %d/%d repos downloaded",
-            keyword, date_filter, sum(results), len(results)
-        )
-
-
-# ── Tavily helpers ────────────────────────────────────────────────────────────
+# ── LLM Summarisation Prompts ─────────────────────────────────────────────────
 
 _WEB_SUMMARISE_PROMPT = ChatPromptTemplate.from_messages([
     (
@@ -151,10 +53,7 @@ _WEB_SUMMARISE_PROMPT = ChatPromptTemplate.from_messages([
         "Keep the summary concise (150-250 words). Translate everything to English. "
         "Avoid marketing fluff — stick to facts and concrete benefits.",
     ),
-    (
-        "human",
-        "{content}",
-    ),
+    ("human", "{content}"),
 ])
 
 _REPO_SUMMARISE_PROMPT = ChatPromptTemplate.from_messages([
@@ -171,22 +70,63 @@ _REPO_SUMMARISE_PROMPT = ChatPromptTemplate.from_messages([
         "Keep the summary concise (150-250 words). "
         "Do NOT include source code. Focus on business relevance.",
     ),
-    (
-        "human",
-        "{content}",
-    ),
+    ("human", "{content}"),
 ])
 
 
+# ── GitHub README fetcher (via tools module) ───────────────────────────────────
+
+def _fetch_github_readmes(keywords: List[str], repos_per_keyword: int = 5) -> List[str]:
+    """
+    Search GitHub for top repositories per keyword and fetch their READMEs
+    directly from raw.githubusercontent.com.
+
+    Returns a list of README text strings (non-empty only).
+    Uses ThreadPoolExecutor for parallel HTTP requests.
+    """
+    from tools import search_github, fetch_readme
+
+    seen_repos: set = set()
+    repo_queue: List[str] = []
+
+    for keyword in keywords:
+        result = search_github(keyword, min_stars=5, max_results=repos_per_keyword)
+        repos = result.get("repos", [])
+        logger.info("GitHub search '%s': %d repos found.", keyword, len(repos))
+        for repo in repos:
+            full_name = repo.get("full_name", "")
+            if full_name and full_name not in seen_repos:
+                seen_repos.add(full_name)
+                repo_queue.append(full_name)
+
+    if not repo_queue:
+        logger.warning("No GitHub repos found for keywords: %s", keywords)
+        return []
+
+    readmes: List[str] = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(fetch_readme, name): name for name in repo_queue}
+        for future in as_completed(futures):
+            result = future.result()
+            if result.get("found") and result.get("content"):
+                readmes.append(result["content"])
+                logger.debug("README fetched: %s (%d chars)", futures[future], len(result["content"]))
+
+    logger.info("Fetched %d READMEs from %d repos.", len(readmes), len(repo_queue))
+    return readmes
+
+
+# ── Web article fetcher ────────────────────────────────────────────────────────
+
 def _fetch_web_docs(keywords: List[str], llm, text_splitter) -> List[str]:
     """
-    Search Tavily for web pages related to each keyword, load and
-    summarise them. Returns a list of summary strings.
+    Search Tavily for web pages related to each keyword, load and summarise
+    them.  Returns a list of summary strings.
     """
     tavily_client = get_tavily_client()
     summarise_chain = _WEB_SUMMARISE_PROMPT | llm
 
-    urls_seen = set()
+    urls_seen: set = set()
     summaries: List[str] = []
 
     for keyword in keywords[:3]:
@@ -218,7 +158,6 @@ def _fetch_web_docs(keywords: List[str], llm, text_splitter) -> List[str]:
                 content = doc.page_content.strip()
                 if not content:
                     continue
-
                 deadline = time.time() + 20
                 try:
                     if len(content) >= 128_000:
@@ -237,55 +176,37 @@ def _fetch_web_docs(keywords: List[str], llm, text_splitter) -> List[str]:
     return summaries
 
 
-# ── Main async function ───────────────────────────────────────────────────────
+# ── Main function (sync) ───────────────────────────────────────────────────────
 
-async def make_db(idea: str, keywords: List[str]):
+def make_db(idea: str, keywords: List[str]):
     """
     Build a FAISS knowledge base from GitHub READMEs and web articles.
 
     Parameters
     ----------
-    idea     : the product idea string (used for context-aware summarisation)
-    keywords : list of search keywords
+    idea     : the product idea string (provides business context)
+    keywords : list of 1-5 GitHub/Tavily search keywords
 
     Returns
     -------
-    FAISS vector store ready for retrieval
+    FAISS vector store ready for similarity retrieval
     """
-    logger.info("Building knowledge database for keywords: %s", keywords)
+    logger.info("Building knowledge DB for keywords: %s", keywords)
     llm = get_llm()
     text_splitter = get_text_splitter()
 
-    os.makedirs(GITHUB_DOWNLOAD_DIR, exist_ok=True)
-    csv_path = os.path.join(DATA_DIR, "repositories.csv")
+    # ── Phase 1: Fetch GitHub READMEs directly ────────────────────────────
+    readme_texts = _fetch_github_readmes(keywords, repos_per_keyword=5)
+    logger.info("GitHub phase complete: %d READMEs collected.", len(readme_texts))
 
-    # ── Phase 1: Download GitHub repos ───────────────────────────────────────
-    with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
-        csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(["user", "repository", "clone_url", "status"])
-
-        connector = aiohttp.TCPConnector(limit=10)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            tasks = [
-                _search_github_keyword(
-                    session, kw, GITHUB_DOWNLOAD_DIR, csv_writer, repos_per_keyword=5
-                )
-                for kw in keywords
-            ]
-            await asyncio.gather(*tasks)
-
-    logger.info("GitHub download phase complete.")
-
-    # ── Phase 2: Extract READMEs from ZIPs ───────────────────────────────────
-    all_texts, _ = process_zip_files_to_faiss(GITHUB_DOWNLOAD_DIR)
-    logger.info("Extracted %d README texts from downloaded repos.", len(all_texts))
-
-    # ── Phase 3: Fetch & summarise web articles ───────────────────────────────
+    # ── Phase 2: Fetch & summarise web articles ───────────────────────────
     web_summaries = _fetch_web_docs(keywords, llm, text_splitter)
-    all_texts.extend(web_summaries)
-    logger.info("Total raw texts (READMEs + web): %d", len(all_texts))
+    logger.info("Web phase complete: %d article summaries collected.", len(web_summaries))
 
-    # ── Phase 4: Summarise all texts for the vector store ────────────────────
+    all_texts = readme_texts + web_summaries
+    logger.info("Total raw texts: %d", len(all_texts))
+
+    # ── Phase 3: LLM-summarise all texts for the vector store ────────────
     repo_chain = _REPO_SUMMARISE_PROMPT | llm
 
     random.shuffle(all_texts)
@@ -298,7 +219,6 @@ async def make_db(idea: str, keywords: List[str]):
             break
         if not text.strip():
             continue
-
         deadline = time.time() + 30
         try:
             if len(text) >= 128_000:
@@ -317,11 +237,10 @@ async def make_db(idea: str, keywords: List[str]):
             logger.warning("Summarisation error: %s", exc)
 
     if not final_docs:
-        # Fallback: create a minimal document so FAISS doesn't fail on an empty list
-        logger.warning("No documents summarised — using idea text as fallback document.")
+        logger.warning("No documents summarised — using idea text as fallback.")
         final_docs = [Document(page_content=idea)]
 
-    # ── Phase 5: Build FAISS index ────────────────────────────────────────────
+    # ── Phase 4: Build FAISS index ────────────────────────────────────────
     logger.info("Building FAISS index from %d documents …", len(final_docs))
     encoder = get_hf_embeddings()
     db = FAISS.from_documents(documents=final_docs, embedding=encoder)

@@ -3,8 +3,19 @@ TAS AutoBD — Proposal Generation Agent
 =========================================
 Uses RAG (retrieval-augmented generation) over the FAISS knowledge base
 to craft a structured business proposal and a polished HTML email.
+
+Agentic enhancements (v2)
+--------------------------
+After the initial email is drafted, a self-reflection cycle runs:
+  1. Critique  — score the email on 5 sales-quality dimensions (1-10 each)
+  2. Refine    — if the overall score is below the quality threshold, apply
+                 the listed improvements in one targeted rewrite pass
+  3. Return    — the best version of the email (original or refined)
+
+This mirrors a senior BD manager reviewing and red-lining a draft before send.
 """
 
+import re
 import logging
 from typing import List
 
@@ -17,6 +28,9 @@ from config import get_llm
 from utils import format_docs
 
 logger = logging.getLogger(__name__)
+
+# Minimum quality score (out of 10) to skip refinement
+_QUALITY_THRESHOLD = 7.5
 
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
@@ -38,7 +52,7 @@ class Proposal(BaseModel):
     success_metrics: str = Field(description="Specific KPIs and outcomes the customer can expect in 6-12 months")
 
 
-# ── Prompts ───────────────────────────────────────────────────────────────────
+# ── Prompts — RAG + Proposal + Email ──────────────────────────────────────────
 
 _RAG_PROMPT = ChatPromptTemplate.from_messages([
     (
@@ -116,11 +130,107 @@ _EMAIL_PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 
+# ── Self-reflection prompts ────────────────────────────────────────────────────
+
+_CRITIQUE_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "You are a senior B2B sales consultant reviewing a business proposal email "
+        "before it is sent to a potential enterprise client.\n\n"
+        "Evaluate the email on exactly these 5 criteria (score each 1-10):\n"
+        "1. Personalization — Does it reference the company's specific situation, pain points, and industry?\n"
+        "2. Evidence        — Are claims backed by concrete metrics, data, or case studies?\n"
+        "3. Urgency         — Does it create a compelling reason to act NOW?\n"
+        "4. Value Clarity   — Is the ROI and business transformation crystal clear?\n"
+        "5. CTA Quality     — Is the call to action specific, low-friction, and easy to accept?\n\n"
+        "Respond in EXACTLY this format (no extra text before or after):\n"
+        "SCORES: personalization=[X]/10, evidence=[X]/10, urgency=[X]/10, value=[X]/10, cta=[X]/10\n"
+        "OVERALL: [average]/10\n"
+        "TOP IMPROVEMENTS:\n"
+        "1. [specific, actionable improvement]\n"
+        "2. [specific, actionable improvement]\n"
+        "3. [specific, actionable improvement]",
+    ),
+    ("human", "Email to critique:\n\n{email_html}"),
+])
+
+_REFINE_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "You are a Business Developer at TAS Design Group Inc. improving a B2B sales email.\n"
+        "Apply ALL the listed improvements to make the email more compelling.\n\n"
+        "Rules:\n"
+        "- Keep the HTML structure and TAS Design Group purple (#4A0E8F) branding\n"
+        "- Keep max-width: 650px mobile-responsive layout\n"
+        "- Do NOT change factual content — only improve framing, specificity, and persuasion\n"
+        "- Return ONLY valid HTML — no markdown fences, no preamble, no explanation",
+    ),
+    (
+        "human",
+        "Original email:\n{email_html}\n\n"
+        "Required improvements:\n{improvements}\n\n"
+        "Return the improved HTML email:",
+    ),
+])
+
+
+# ── Self-reflection helper ─────────────────────────────────────────────────────
+
+def _critique_and_refine(email_html: str, llm) -> str:
+    """
+    Run one critique + conditional refinement cycle on an HTML proposal email.
+
+    Scores the email across 5 sales-quality dimensions.  If the overall score
+    falls below _QUALITY_THRESHOLD (7.5 / 10), one targeted rewrite pass is
+    applied.  Returns the best available version (original or refined).
+    """
+    try:
+        critique_chain = _CRITIQUE_PROMPT | llm | StrOutputParser()
+        critique = critique_chain.invoke({"email_html": email_html[:12_000]})
+        logger.info("Critique output:\n%s", critique[:400])
+
+        # Parse overall score
+        score_match = re.search(
+            r"OVERALL:\s*(\d+(?:\.\d+)?)\s*/\s*10", critique, re.IGNORECASE
+        )
+        score = float(score_match.group(1)) if score_match else 8.0
+        logger.info("Proposal quality score: %.1f / 10 (threshold %.1f)", score, _QUALITY_THRESHOLD)
+
+        if score >= _QUALITY_THRESHOLD:
+            logger.info("Score %.1f meets threshold — no refinement needed.", score)
+            return email_html
+
+        # Extract the improvements section
+        imp_match = re.search(
+            r"TOP IMPROVEMENTS:(.*?)$", critique, re.DOTALL | re.IGNORECASE
+        )
+        improvements = imp_match.group(1).strip() if imp_match else critique
+
+        logger.info("Refining proposal (score %.1f < %.1f) …", score, _QUALITY_THRESHOLD)
+        refine_chain = _REFINE_PROMPT | llm | StrOutputParser()
+        refined = refine_chain.invoke(
+            {"email_html": email_html, "improvements": improvements}
+        )
+
+        # Basic sanity check: refined output should look like HTML
+        if refined.strip().startswith("<"):
+            logger.info("Refinement successful (%d chars).", len(refined))
+            return refined
+
+        logger.warning("Refined output did not look like HTML — keeping original.")
+        return email_html
+
+    except Exception as exc:
+        logger.warning("Critique/refine cycle failed (%s) — returning original.", exc)
+        return email_html
+
+
 # ── Main function ─────────────────────────────────────────────────────────────
 
 def make_proposal(idea: str, db, company_name: str) -> str:
     """
-    Generate an HTML email proposal for *company_name* using RAG over *db*.
+    Generate an HTML email proposal for *company_name* using RAG over *db*,
+    then run a self-reflection critique+refine cycle.
 
     Parameters
     ----------
@@ -130,12 +240,12 @@ def make_proposal(idea: str, db, company_name: str) -> str:
 
     Returns
     -------
-    HTML string of the ready-to-send email
+    HTML string of the ready-to-send, quality-reviewed email
     """
     logger.info("Generating proposal for: %s", company_name)
     llm = get_llm()
 
-    # ── Step 1: RAG retrieval — gather relevant evidence ─────────────────────
+    # ── Step 1: RAG retrieval ─────────────────────────────────────────────
     retriever = db.as_retriever(search_kwargs={"k": 5})
     rag_chain = (
         {"context": retriever | format_docs, "question": RunnablePassthrough()}
@@ -144,16 +254,14 @@ def make_proposal(idea: str, db, company_name: str) -> str:
         | StrOutputParser()
     )
     rag_summary = rag_chain.invoke(idea)
-    logger.info("RAG summary generated (%d chars)", len(rag_summary))
+    logger.info("RAG summary: %d chars", len(rag_summary))
 
-    # ── Step 2: structured proposal using with_structured_output ─────────────
+    # ── Step 2: Structured proposal ───────────────────────────────────────
     structured_llm = llm.with_structured_output(Proposal)
     try:
         proposal: Proposal = structured_llm.invoke(
             _PROPOSAL_PROMPT.format_messages(research=rag_summary, idea=idea)
         )
-
-        # Format proposal for email prompt
         features_text = "\n".join(
             f"  - {f.name}: {f.description} (Impact: {f.impact})"
             for f in proposal.key_features
@@ -172,13 +280,17 @@ def make_proposal(idea: str, db, company_name: str) -> str:
         logger.warning("Structured proposal failed, using raw RAG summary: %s", exc)
         proposal_text = rag_summary
 
-    logger.info("Structured proposal generated.")
+    logger.info("Structured proposal ready.")
 
-    # ── Step 3: email drafting ────────────────────────────────────────────────
+    # ── Step 3: Draft HTML email ──────────────────────────────────────────
     email_chain = _EMAIL_PROMPT | llm | StrOutputParser()
-    email_html = email_chain.invoke({
-        "proposal": proposal_text,
-        "customer_name": company_name,
-    })
-    logger.info("Email draft ready for: %s", company_name)
+    email_html = email_chain.invoke(
+        {"proposal": proposal_text, "customer_name": company_name}
+    )
+    logger.info("Initial email draft ready (%d chars).", len(email_html))
+
+    # ── Step 4: Self-reflection — critique & conditional refinement ───────
+    email_html = _critique_and_refine(email_html, llm)
+    logger.info("Proposal finalised for: %s", company_name)
+
     return email_html
